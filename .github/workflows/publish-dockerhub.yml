@@ -28,7 +28,7 @@ jobs:
         uses: docker/login-action@v4
         with:
           username: ${{ vars.DOCKERHUB_USERNAME || 'chuais' }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN || secrets.TOK }}
 
       - name: Build and push relay image
         uses: docker/build-push-action@v7
