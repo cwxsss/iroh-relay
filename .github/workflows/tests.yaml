@@ -353,6 +353,7 @@ jobs:
       # not SCCACHE_GHA_ENABLED.
       RUSTC_WRAPPER: "sccache"
       CFLAGS: "/std:c11 /experimental:c11atomics"
+      CMAKE_GENERATOR: "Visual Studio 18 2026"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
