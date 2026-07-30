@@ -352,7 +352,7 @@ jobs:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
       RUSTC_WRAPPER: "sccache"
-      CFLAGS: "/std:c11"
+      CFLAGS: "/std:c11 /experimental:c11atomics"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
