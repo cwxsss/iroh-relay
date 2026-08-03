@@ -24,10 +24,12 @@ use iroh_relay::{
 };
 use n0_error::{Result, StdResultExt, bail_any};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 use tracing_subscriber::{EnvFilter, prelude::*};
 use url::Url;
 use webpki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use zeroize::{Zeroize, Zeroizing};
 
 /// The default `http_bind_port` when using `--dev`.
 const DEV_MODE_HTTP_PORT: u16 = 3340;
@@ -35,6 +37,9 @@ const DEV_MODE_HTTP_PORT: u16 = 3340;
 const X_IROH_ENDPOINT_ID: &str = "X-Iroh-NodeId";
 /// Environment variable to read a bearer token for HTTP auth requests from.
 const ENV_HTTP_BEARER_TOKEN: &str = "IROH_RELAY_HTTP_BEARER_TOKEN";
+const ENV_CLIENT_AUTH_TOKEN: &str = "IROH_RELAY_CLIENT_AUTH_TOKEN";
+const MIN_CLIENT_AUTH_TOKEN_LENGTH: usize = 32;
+const MAX_CLIENT_AUTH_TOKEN_LENGTH: usize = 512;
 
 /// A relay server for iroh.
 #[derive(Parser, Debug, Clone)]
@@ -154,6 +159,9 @@ enum AccessConfig {
     /// Allows everyone
     #[default]
     Everyone,
+    /// Requires a matching bearer token only when
+    /// `IROH_RELAY_CLIENT_AUTH_TOKEN` is set in the service environment.
+    Token,
     /// Allows only these endpoints.
     Allowlist(Vec<EndpointId>),
     /// Allows everyone, except these endpoints.
@@ -185,6 +193,7 @@ impl From<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
     fn from(cfg: AccessConfig) -> Self {
         match cfg {
             AccessConfig::Everyone => Arc::new(iroh_relay::server::AllowAll),
+            AccessConfig::Token => Arc::new(TokenAccess::from_env()),
             AccessConfig::Allowlist(allow_list) => Arc::new(AllowlistAccess(allow_list)),
             AccessConfig::Denylist(deny_list) => Arc::new(DenylistAccess(deny_list)),
             AccessConfig::Http(mut config) => {
@@ -198,6 +207,112 @@ impl From<AccessConfig> for Arc<dyn iroh_relay::server::DynAccessControl> {
                 }
                 Arc::new(HttpAccess { client, config })
             }
+        }
+    }
+}
+
+/// Optional bearer-token access control for relay clients.
+///
+/// The configured secret is immediately hashed so the access-control state does
+/// not retain its plaintext value. An unset or empty environment variable
+/// leaves the relay open, preserving the default behavior.
+struct TokenAccess {
+    expected_token_hash: Option<blake3::Hash>,
+    invalid_configuration: bool,
+}
+
+impl std::fmt::Debug for TokenAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenAccess")
+            .field("configured", &self.expected_token_hash.is_some())
+            .field("invalid_configuration", &self.invalid_configuration)
+            .finish()
+    }
+}
+
+impl TokenAccess {
+    fn new(token: Option<String>) -> Self {
+        let Some(token) = token.filter(|token| !token.is_empty()) else {
+            return Self {
+                expected_token_hash: None,
+                invalid_configuration: false,
+            };
+        };
+        let token = Zeroizing::new(token);
+        if !is_valid_client_auth_token(&token) {
+            warn!(
+                environment_variable = ENV_CLIENT_AUTH_TOKEN,
+                "relay client token is invalid; denying all relay clients"
+            );
+            return Self {
+                expected_token_hash: None,
+                invalid_configuration: true,
+            };
+        }
+        Self {
+            expected_token_hash: Some(blake3::hash(token.as_bytes())),
+            invalid_configuration: false,
+        }
+    }
+
+    fn from_env() -> Self {
+        match std::env::var(ENV_CLIENT_AUTH_TOKEN) {
+            Ok(token) => Self::new(Some(token)),
+            Err(std::env::VarError::NotPresent) => Self::new(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                warn!(
+                    environment_variable = ENV_CLIENT_AUTH_TOKEN,
+                    "relay client token is not valid Unicode; denying all relay clients"
+                );
+                Self {
+                    expected_token_hash: None,
+                    invalid_configuration: true,
+                }
+            }
+        }
+    }
+
+    fn is_authorized(&self, token: Option<&str>) -> bool {
+        if self.invalid_configuration {
+            return false;
+        }
+
+        let Some(expected_token_hash) = self.expected_token_hash.as_ref() else {
+            return true;
+        };
+        token.is_some_and(|token| {
+            if !is_valid_client_auth_token(token) {
+                return false;
+            }
+            bool::from(
+                expected_token_hash
+                    .as_bytes()
+                    .ct_eq(blake3::hash(token.as_bytes()).as_bytes()),
+            )
+        })
+    }
+}
+
+fn is_valid_client_auth_token(token: &str) -> bool {
+    (MIN_CLIENT_AUTH_TOKEN_LENGTH..=MAX_CLIENT_AUTH_TOKEN_LENGTH).contains(&token.len())
+        && token.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+impl AccessControl for TokenAccess {
+    async fn on_connect(&self, request: &ClientRequest) -> Access {
+        let Some(mut token) = request.auth_token() else {
+            return if self.is_authorized(None) {
+                Access::Allow
+            } else {
+                Access::Deny { reason: None }
+            };
+        };
+        let allowed = self.is_authorized(Some(&token));
+        token.zeroize();
+        if allowed {
+            Access::Allow
+        } else {
+            Access::Deny { reason: None }
         }
     }
 }
@@ -698,6 +813,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use iroh_base::SecretKey;
+    use iroh_relay::http::ProtocolVersion;
     use n0_error::Result;
     use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -745,6 +861,9 @@ mod tests {
         ";
         let config = Config::from_str(config)?;
         assert_eq!(config.access, AccessConfig::Everyone);
+
+        let config = Config::from_str("access = \"token\"")?;
+        assert_eq!(config.access, AccessConfig::Token);
 
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let endpoint_id = SecretKey::from_bytes(&rng.random()).public();
@@ -811,6 +930,69 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn token_access_is_optional_and_requires_a_matching_token_when_configured() {
+        let open_access = TokenAccess::new(None);
+        assert!(open_access.is_authorized(None));
+
+        let protected_token = "0123456789abcdef0123456789abcdef";
+        let protected_access = TokenAccess::new(Some(protected_token.to_string()));
+        assert!(!protected_access.is_authorized(None));
+        assert!(!protected_access.is_authorized(Some("fedcba9876543210fedcba9876543210")));
+        assert!(protected_access.is_authorized(Some(protected_token)));
+
+        let invalid_access = TokenAccess::new(Some("too-short".to_string()));
+        assert!(!invalid_access.is_authorized(Some(protected_token)));
+    }
+
+    #[tokio::test]
+    async fn token_access_accepts_bearer_and_query_tokens() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let access = TokenAccess::new(Some(token.to_string()));
+
+        let request = |request: http::Request<()>| {
+            ClientRequest::new(
+                SecretKey::from_bytes(&[42; 32]).public(),
+                ProtocolVersion::V2,
+                request.into_parts().0,
+            )
+        };
+
+        let bearer_request = request(
+            http::Request::builder()
+                .uri("https://relay.example/")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(())
+                .unwrap(),
+        );
+        assert!(matches!(
+            access.on_connect(&bearer_request).await,
+            Access::Allow
+        ));
+
+        let query_request = request(
+            http::Request::builder()
+                .uri(format!("https://relay.example/?token={token}"))
+                .body(())
+                .unwrap(),
+        );
+        assert!(matches!(
+            access.on_connect(&query_request).await,
+            Access::Allow
+        ));
+
+        let missing_token_request = request(
+            http::Request::builder()
+                .uri("https://relay.example/")
+                .body(())
+                .unwrap(),
+        );
+        assert!(matches!(
+            access.on_connect(&missing_token_request).await,
+            Access::Deny { .. }
+        ));
     }
 
     #[tokio::test]

@@ -23,6 +23,30 @@ relays, including:
 
 Used in [iroh], created with love by the [n0 team](https://n0.computer/).
 
+## Optional client access tokens
+
+By default, a relay accepts every client. To make a self-hosted relay require
+the access token configured in UniClipboard's custom relay settings, add this
+to its TOML configuration:
+
+```toml
+access = "token"
+```
+
+Then provide the secret only through the service environment, never in the
+TOML file or command line:
+
+```text
+IROH_RELAY_CLIENT_AUTH_TOKEN=<a-random-token-with-32-to-512-visible-ASCII-characters>
+```
+
+With `access = "token"`, an unset or empty environment variable keeps the
+relay open. When it is set, clients must send the same token. Native clients
+send it as `Authorization: Bearer <token>`; browser clients use the `token`
+query parameter. Use HTTPS in production and redact that query parameter from
+reverse-proxy access logs. Restart the relay after changing the environment
+variable.
+
 ## Local testing
 
 Advice for testing your application that uses `iroh` with a locally running `iroh-relay` server
