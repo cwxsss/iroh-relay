@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
         ref: ${{ inputs.branch }}
@@ -113,7 +113,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@v0.0.11
       continue-on-error: true
     - uses: ./.github/workflows/sccache-probe
 
@@ -191,7 +191,7 @@ jobs:
     - name: Cache AWS CLI
       if: always()
       id: cache-awscli
-      uses: actions/cache@v5
+      uses: actions/cache@v6
       with:
         path: ~/awscli
         key: awscli-${{ runner.os }}-${{ runner.arch }}-v2
