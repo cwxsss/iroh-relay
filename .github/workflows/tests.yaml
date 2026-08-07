@@ -349,9 +349,8 @@ jobs:
             os: windows
             runner: windows-latest
     env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
+      # sccache repeatedly fails to spawn rustc on GitHub-hosted Windows.
+      # Run this minimal-version check directly instead.
       CFLAGS: "/std:c11 /experimental:c11atomics"
       CMAKE_GENERATOR: "Visual Studio 18 2026"
     steps:
@@ -365,11 +364,6 @@ jobs:
           rustup toolchain install nightly
           rustup target add ${{ matrix.target }}
           rustup set default-host ${{ matrix.target }}
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
 
       - uses: msys2/setup-msys2@v2
         with:
