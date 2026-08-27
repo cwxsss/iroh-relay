@@ -46,7 +46,7 @@ jobs:
       runs-on: [self-hosted, linux, X64]
       steps:
         - name: Checkout
-          uses: actions/checkout@v6
+          uses: actions/checkout@v7
 
         - name: Set up Docker Buildx
           uses: docker/setup-buildx-action@v4
@@ -64,7 +64,7 @@ jobs:
 
         - name: Cache AWS CLI
           id: cache-awscli
-          uses: actions/cache@v5
+          uses: actions/cache@v6
           with:
             path: ~/awscli
             key: awscli-${{ runner.os }}-${{ runner.arch }}-v2
