@@ -72,19 +72,19 @@ jobs:
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                                                                           
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'                                                                                                                   
+              runs_on: '["macos-latest"]'
             - name: macOS-arm-latest                                                                                
               features: none                                                                                                                                               
               os: macOS-latest
               release-os: darwin                                                                                                                                           
               release-arch: aarch64                                                                                 
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: '["macos-latest"]'
             - name: macOS-arm-latest                                                                                                                                       
               features: default
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                    
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: '["macos-latest"]'
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -210,7 +210,7 @@ jobs:
         include:
           - name: windows-latest
             os: windows
-            runner: [self-hosted, windows, x64]
+            runner: windows-latest
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -319,12 +319,12 @@ jobs:
             os: ubuntu-latest
             release-os: linux
             release-arch: amd64
-            runner: [self-hosted, linux, X64]
+            runner: ubuntu-latest
           - name: macOS-arm-latest
             os: macOS-latest
             release-os: darwin
             release-arch: aarch64
-            runner: [self-hosted, macOS, ARM64]
+            runner: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -347,11 +347,12 @@ jobs:
         include:
           - name: windows-latest
             os: windows
-            runner: [self-hosted, windows, x64]
+            runner: windows-latest
     env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
+      # sccache repeatedly fails to spawn rustc on GitHub-hosted Windows.
+      # Run this minimal-version check directly instead.
+      CFLAGS: "/std:c11 /experimental:c11atomics"
+      CMAKE_GENERATOR: "Visual Studio 18 2026"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -363,11 +364,6 @@ jobs:
           rustup toolchain install nightly
           rustup target add ${{ matrix.target }}
           rustup set default-host ${{ matrix.target }}
-
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-        continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
 
       - uses: msys2/setup-msys2@v2
         with:

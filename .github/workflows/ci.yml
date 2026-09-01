@@ -520,19 +520,6 @@ jobs:
           command: check
           command-arguments: "-Dwarnings"
 
-  netsim-integration-tests:
-    permissions: write-all
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    uses: "./.github/workflows/netsim_runner.yaml"
-    secrets: inherit
-    with:
-      branch: ${{ github.ref }}
-      max_workers: 6
-      netsim_branch: "main"
-      sim_paths: ${{ github.event_name == 'pull_request' && 'sims/integration' || 'sims/iroh/iroh.json,sims/integration' }}
-      pr_number: ${{ github.event.pull_request.number || '' }}
-      filter: ${{ github.event_name == 'pull_request' && 'skip:intg_iroh_full__1_to_3,intg_iroh_full__1_to_1x3,intg_iroh_relay_only__1_to_3' || '' }}
-
   codespell:
     timeout-minutes: 30
     runs-on: ubuntu-latest

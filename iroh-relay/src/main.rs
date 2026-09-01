@@ -687,7 +687,8 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
     server_config.quic = quic_config;
     #[cfg(feature = "metrics")]
     {
-        server_config.metrics_addr = Some(cfg.metrics_bind_addr()).filter(|_| cfg.enable_metrics);
+        let metrics_addr = cfg.metrics_bind_addr();
+        server_config.metrics_addr = cfg.enable_metrics.then_some(metrics_addr);
     }
     Ok(server_config)
 }

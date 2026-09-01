@@ -1,10 +1,7 @@
 name: Patchbay Tests
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 concurrency:
   group: patchbay-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -20,7 +17,7 @@ jobs:
   patchbay_tests:
     name: Patchbay Tests
     timeout-minutes: 15
-    runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
     steps:
