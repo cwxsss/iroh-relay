@@ -2,7 +2,7 @@
 
 这个目录部署的是 iroh relay，不是 UniClipboard headless 节点。relay 仅在两台设备不能直连时转发加密的 iroh 流量：它不加入 Space、不需要 Space 口令或邀请码、不提供移动端 HTTP 网关，也不保存剪贴板历史。
 
-群晖 headless 节点请使用 [`deploy/synology/`](../synology/README_ZH.md)。两个服务不要合并到同一个 Compose 或同一套数据卷。
+群晖 headless 节点属于 UniClipboard 主仓库的部署内容，不在本仓库维护。两个服务不要合并到同一个 Compose，也不要共用同一套数据卷。
 
 ## 版本策略
 
@@ -15,7 +15,7 @@ IROH_RELAY_IMAGE=chuais/iroh-relay:1.0.0-rc.1 docker compose pull
 IROH_RELAY_IMAGE=chuais/iroh-relay:1.0.0-rc.1 docker compose up -d --no-build
 ```
 
-默认 Compose 保留本地源码构建能力。通过 `IROH_RELAY_IMAGE` 设置镜像名并使用 `--no-build`，即可仅拉取预构建镜像。
+默认 Compose 保留本地源码构建能力（使用仓库根目录的 `Dockerfile`，构建上下文为仓库根目录）。通过 `IROH_RELAY_IMAGE` 设置镜像名并使用 `--no-build`，即可仅拉取预构建镜像。
 
 ## 前置条件
 
@@ -57,6 +57,8 @@ curl -sS -o /dev/null -w 'http_code=%{http_code}\n' https://relay.example.com/pi
 
 返回 `http_code=200` 表示 HTTPS relay 可达。还应确认宿主机防火墙放行了 `7842/udp`，它用于 QUIC 地址发现和 NAT 探测。
 
+要确认 WebSocket 中继端点本身可用（而不只是 HTTPS 可达），需要带 `Sec-WebSocket-Protocol` 请求头访问 `/relay`；缺少该请求头时 relay 会返回 `400 missing header: sec-websocket-protocol`。客户端会在该请求头中同时声明 `iroh-relay-v1` 与 `iroh-relay-v2`，只要返回 `101 Switching Protocols` 即表示协议版本匹配。
+
 ## 在客户端启用
 
 在**每台支持自定义 relay 的 UniClipboard 桌面端**中打开“设置 → 网络 → 自定义中继节点”，填入：
@@ -76,4 +78,4 @@ https://relay.example.com
 | 群晖 headless 节点 | 是 | 是，`/data` | 首次置备时需要 | `42720/tcp`、可选固定 iroh UDP |
 | iroh relay | 否 | 仅 TLS 证书 | 否 | `80/tcp`、`443/tcp`、`7842/udp` |
 
-当设备可以直接建立 iroh 连接时，relay 不在数据路径中；只有打洞失败时才作为加密传输的后备通道。
+当设备可以直接建立 iroh 连接时，relay 不在数据路径中；只有打洞失败时才作为加密传输的后备通道。relay 仍然是直连的前提：地址发布（pkarr/DNS）与打洞协调都要经过 relay，relay 不可用会导致双方都无法找到对方。
