@@ -1,8 +1,8 @@
 services:
   relay:
-    image: ${IROH_RELAY_IMAGE:-uniclipboard-iroh-relay:1.0.0-rc.1}
+    image: ${IROH_RELAY_IMAGE:-chuais/iroh-relay:1.0.0-rc.1}
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile
     restart: unless-stopped
     command: ["--config-path", "/etc/iroh-relay/config.toml"]
