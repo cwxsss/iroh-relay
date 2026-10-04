@@ -25,6 +25,7 @@ use std::{
     task::Poll,
 };
 
+use bytes::Bytes;
 use ed25519_dalek::{VerifyingKey, pkcs8::DecodePublicKey};
 use futures_util::{FutureExt, future::Shared};
 use iroh_base::{EndpointId, RelayUrl};
@@ -32,7 +33,7 @@ use n0_error::{e, stack_error};
 use n0_future::{TryFutureExt, future::Boxed as BoxFuture, time::Duration};
 use noq::WeakConnectionHandle as NoqWeakConnectionHandle;
 use pin_project::pin_project;
-use tracing::{event, warn};
+use tracing::{error, event, warn};
 
 use super::quic::DecryptedInitial;
 use crate::{
@@ -41,8 +42,8 @@ use crate::{
         AfterHandshakeOutcome,
         quic::{
             AcceptBi, AcceptUni, Closed, ConnectionError, ConnectionStats, Controller,
-            ExportKeyingMaterialError, OpenBi, OpenUni, PathId, ReadDatagram, SendDatagram,
-            SendDatagramError, ServerConfig, Side, VarInt,
+            ExportKeyingMaterialError, OpenBi, OpenUni, PathId, ReadDatagram, ReadManyDatagrams,
+            SendDatagram, SendDatagramError, ServerConfig, Side, VarInt,
         },
     },
     socket::{
@@ -201,8 +202,13 @@ impl Incoming {
 
     /// Returns the remote address of this incoming connection.
     pub fn remote_addr(&self) -> IncomingAddr {
+        let remote = self.inner.remote_address();
         self.ep
-            .to_transport_addr(self.inner.remote_address())
+            .to_transport_addr(remote)
+            .unwrap_or_else(|| {
+                error!(mapped_addr = ?remote, "Incoming::remote_addr: invalid mapped address");
+                transports::Addr::Ip(remote)
+            })
             .into()
     }
 
@@ -214,7 +220,7 @@ impl Incoming {
         self.inner.remote_address_validated()
     }
 
-    /// Decrypt the Initial packet payload
+    /// Decrypts the Initial packet payload.
     ///
     /// This clones and decrypts the packet payload (~1200 bytes).
     /// Can be used to extract information from the TLS ClientHello without completing the handshake.
@@ -641,8 +647,13 @@ impl Accepting {
 
     /// Returns the remote address of this connection.
     pub fn remote_addr(&self) -> IncomingAddr {
+        let remote = self.inner.remote_address();
         self.ep
-            .to_transport_addr(self.inner.remote_address())
+            .to_transport_addr(remote)
+            .unwrap_or_else(|| {
+                error!(mapped_addr = ?remote, "Accepting::remote_addr: invalid mapped address");
+                transports::Addr::Ip(remote)
+            })
             .into()
     }
 
@@ -811,9 +822,65 @@ pub struct RemoteEndpointIdError;
 impl<T: ConnectionState> Connection<T> {
     /// Initiates a new outgoing unidirectional stream.
     ///
-    /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
-    /// consequence, the peer won’t be notified that a stream has been opened until the
-    /// stream is actually used.
+    /// A unidirectional stream can only transmit data from the endpoint which opens the
+    /// stream, the endpoint accepting the stream can not send any data back on the same
+    /// stream.
+    ///
+    /// # QUIC streams
+    ///
+    /// QUIC can multiplex many streams onto a single connection. Streams can be short or
+    /// long lived and may be opened and closed without incurring any extra cost. The data
+    /// sent in each stream is delivered strictly ordered, yet multiple streams will be
+    /// transmitted interleaved and packet loss on one stream will not delay other
+    /// streams. Thus streams do not suffer head-of-line blocking.
+    ///
+    /// # Opening streams
+    ///
+    /// Both peers of a connection can open streams at any time. Opening a new stream does
+    /// not incur any extra overhead compared to sending data on an existing stream. However
+    /// only once some data has been transmitted on the stream, will the peer become aware
+    /// of the newly opened stream.
+    ///
+    /// # Accepting streams
+    ///
+    /// Each stream needs to be *accepted* by the peer, using either [`Self::accept_uni`] or
+    /// [`Self::accept_bi`] depending on the stream type. Repeated accept call will yield a
+    /// new stream whenever the peer opens a new stream.
+    ///
+    /// Note that opening a stream is not sufficient for the accept call to yield a new
+    /// stream. Data must be sent on a stream before the respective accept call at the peer
+    /// will yield a [`RecvStream`].
+    ///
+    /// # Stream priorities
+    ///
+    /// Streams can have different priorities set using [`SendStream::set_priority`]. Data
+    /// of streams with a higher priority will be transmitted to the peer before data from
+    /// streams with a lower priority.
+    ///
+    /// # Stream limits
+    ///
+    /// The number of streams which can be open concurrently defaults to
+    /// [`QuicTransportConfigBuilder::max_concurrent_uni_streams`] and
+    /// [`QuicTransportConfigBuilder::max_concurrent_bidi_streams`]. While the connection is
+    /// open these limits can be changed using [`Self::set_max_concurrent_uni_streams`] and
+    /// [`Self::set_max_concurrent_bi_streams`].
+    ///
+    /// Each stream has a *receive window* of a maximum number of bytes that may be
+    /// in-flight before the sender is blocked from transmitting more. This is configured in
+    /// [`QuicTransportConfigBuilder::stream_receive_window`]. There is also a
+    /// [`QuicTransportConfigBuilder::receive_window`] which applies to all streams combined
+    /// and can be changed during a connection using [`Self::set_receive_window`].
+    ///
+    /// The protocol limits the total number of streams during the lifetime of a connection
+    /// to 2**62, this limit applies to the sum of uni- and bi-directional streams. For most
+    /// practical purposes this is essentially unlimited.
+    ///
+    /// [`QuicTransportConfigBuilder::max_concurrent_uni_streams`]: super::QuicTransportConfigBuilder::max_concurrent_uni_streams
+    /// [`QuicTransportConfigBuilder::max_concurrent_bidi_streams`]: super::QuicTransportConfigBuilder::max_concurrent_bidi_streams
+    /// [`QuicTransportConfigBuilder::stream_receive_window`]: super::QuicTransportConfigBuilder::stream_receive_window
+    /// [`QuicTransportConfigBuilder::receive_window`]: super::QuicTransportConfigBuilder::receive_window
+    /// [`SendStream::set_priority`]: super::SendStream::set_priority
+    /// [`RecvStream`]: super::RecvStream
     #[inline]
     pub fn open_uni(&self) -> OpenUni<'_> {
         self.inner.open_uni()
@@ -821,35 +888,26 @@ impl<T: ConnectionState> Connection<T> {
 
     /// Initiates a new outgoing bidirectional stream.
     ///
-    /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
-    /// consequence, the peer won't be notified that a stream has been opened until the
-    /// stream is actually used. Calling [`open_bi`] then waiting on the [`RecvStream`]
-    /// without writing anything to [`SendStream`] will never succeed.
+    /// Bidirectional streams allows both peers to send as well as receive data. They act as
+    /// a pair of related unidirectional streams.
     ///
-    /// [`open_bi`]: Connection::open_bi
-    /// [`SendStream`]: crate::endpoint::SendStream
-    /// [`RecvStream`]: crate::endpoint::RecvStream
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn open_bi(&self) -> OpenBi<'_> {
         self.inner.open_bi()
     }
 
     /// Accepts the next incoming uni-directional stream.
+    ///
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn accept_uni(&self) -> AcceptUni<'_> {
         self.inner.accept_uni()
     }
 
-    /// Accept the next incoming bidirectional stream.
+    /// Accepts the next incoming bidirectional stream.
     ///
-    /// **Important Note**: The peer that calls [`open_bi`] must write to its [`SendStream`]
-    /// before the peer `Connection` is able to accept the stream using
-    /// `accept_bi()`. Calling [`open_bi`] then waiting on the [`RecvStream`] without
-    /// writing anything to the connected [`SendStream`] will never succeed.
-    ///
-    /// [`open_bi`]: Connection::open_bi
-    /// [`SendStream`]: crate::endpoint::SendStream
-    /// [`RecvStream`]: crate::endpoint::RecvStream
+    /// See [`Self::open_uni`] for a detailed description of how streams work.
     #[inline]
     pub fn accept_bi(&self) -> AcceptBi<'_> {
         self.inner.accept_bi()
@@ -861,7 +919,22 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.read_datagram()
     }
 
-    /// Wait for the connection to be closed for any reason.
+    /// Receives a batch of application datagrams into `out`, in arrival order.
+    ///
+    /// This is the batch analogue of [`read_datagram()`](Self::read_datagram). The returned
+    /// future resolves once at least one datagram is buffered, drains up to `out.len()` of
+    /// them into `out` from the front, and yields the count written. Use this instead of
+    /// `read_datagram()` in a loop when forwarding bursts: a whole batch is taken under a
+    /// single lock hold.
+    #[inline]
+    pub fn read_many_datagrams<'a, 'b>(
+        &'a self,
+        out: &'b mut [Bytes],
+    ) -> ReadManyDatagrams<'a, 'b> {
+        self.inner.read_many_datagrams(out)
+    }
+
+    /// Waits for the connection to be closed for any reason.
     ///
     /// Despite the return type's name, closed connections are often not an error condition
     /// at the application layer. Cases that might be routine include
@@ -919,8 +992,22 @@ impl<T: ConnectionState> Connection<T> {
     /// of order, and `data` must both fit inside a single QUIC packet and be smaller than
     /// the maximum dictated by the peer.
     #[inline]
-    pub fn send_datagram(&self, data: bytes::Bytes) -> Result<(), SendDatagramError> {
+    pub fn send_datagram(&self, data: Bytes) -> Result<(), SendDatagramError> {
         self.inner.send_datagram(data)
+    }
+
+    /// Transmits many unreliable, unordered application datagrams in a single call.
+    ///
+    /// This is the batch analogue of [`send_datagram()`](Self::send_datagram): it queues the
+    /// whole batch under one lock hold and wakes the driver once, reducing the per-datagram
+    /// overhead of calling `send_datagram()` repeatedly. Like `send_datagram()`, older queued
+    /// datagrams may be dropped to make room.
+    ///
+    /// Returns the number of datagrams queued. The batch is rejected with
+    /// [`SendDatagramError::TooLarge`] if any datagram exceeds the maximum datagram size.
+    #[inline]
+    pub fn send_many_datagrams(&self, datagrams: &[Bytes]) -> Result<usize, SendDatagramError> {
+        self.inner.send_many_datagrams(datagrams)
     }
 
     /// Transmits `data` as an unreliable, unordered application datagram
@@ -932,7 +1019,7 @@ impl<T: ConnectionState> Connection<T> {
     ///
     /// [`send_datagram()`]: Connection::send_datagram
     #[inline]
-    pub fn send_datagram_wait(&self, data: bytes::Bytes) -> SendDatagram<'_> {
+    pub fn send_datagram_wait(&self, data: Bytes) -> SendDatagram<'_> {
         self.inner.send_datagram_wait(data)
     }
 
@@ -1043,7 +1130,11 @@ impl<T: ConnectionState> Connection<T> {
         self.inner.set_max_concurrent_uni_streams(count)
     }
 
-    /// See [`noq_proto::TransportConfig::receive_window`].
+    /// Sets the connection-level flow control receive window.
+    ///
+    /// See [`QuicTransportConfigBuilder::receive_window`].
+    ///
+    /// [`QuicTransportConfigBuilder::receive_window`]: super::QuicTransportConfigBuilder::receive_window
     #[inline]
     pub fn set_receive_window(&self, receive_window: VarInt) {
         self.inner.set_receive_window(receive_window)
@@ -1188,10 +1279,10 @@ impl Connection<OutgoingZeroRtt> {
 
     /// Waits until the full handshake occurs and returns a [`ZeroRttStatus`].
     ///
-    /// If `ZeroRttStatus::Accepted` is returned, than any streams created before
+    /// If `ZeroRttStatus::Accepted` is returned, then any streams created before
     /// the handshake has completed can still be used.
     ///
-    /// If `ZeroRttStatus::Rejected` is returned, than any streams created before
+    /// If `ZeroRttStatus::Rejected` is returned, then any streams created before
     /// the handshake will error and any data sent should be re-sent on a
     /// new stream.
     ///
@@ -1274,7 +1365,7 @@ mod tests {
     use std::time::Duration;
 
     use iroh_base::{EndpointAddr, SecretKey};
-    use iroh_relay::tls::CaRootsConfig;
+    use iroh_relay::tls::CaTlsConfig;
     use n0_error::{Result, StackResultExt, StdResultExt};
     use n0_future::{Stream, StreamExt};
     use n0_tracing_test::traced_test;
@@ -1503,11 +1594,11 @@ mod tests {
     async fn test_paths_watcher() -> Result {
         const ALPN: &[u8] = b"test";
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let (relay_map, _relay_map, _guard) = run_relay_server().await?;
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
         let server = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
             .secret_key(SecretKey::from_bytes(&rng.random()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await?;
@@ -1515,7 +1606,7 @@ mod tests {
         let client = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(relay_map.clone()))
             .secret_key(SecretKey::from_bytes(&rng.random()))
-            .ca_roots_config(CaRootsConfig::insecure_skip_verify())
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
             .bind()
             .await?;
 
@@ -1532,7 +1623,7 @@ mod tests {
         let mut paths_client = conn_client.paths_stream();
         let mut paths_server = conn_server.paths_stream();
 
-        /// Advances the path stream until at least one IP and one relay paths are available.
+        /// Advances the path stream until at least one IP and one relay path is available.
         ///
         /// Panics if the path stream finishes before that happens.
         async fn wait_for_paths(mut stream: impl Send + Unpin + Stream<Item = PathList<'_>>) {

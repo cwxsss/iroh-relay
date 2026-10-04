@@ -41,7 +41,7 @@
 //! }
 //! ```
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -53,7 +53,7 @@ use n0_future::{
     task::{self, AbortOnDropHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, field::Empty, info_span, trace, warn};
+use tracing::{Instrument, debug, error, field::Empty, info_span, trace, warn};
 
 use crate::{
     Endpoint,
@@ -174,7 +174,7 @@ pub enum IncomingFilterOutcome {
     ///
     /// What this does depends on the connection type:
     ///
-    /// - **Direct (UDP) connections** : this is QUIC source address
+    /// - **Direct (UDP) connections**: this is QUIC source address
     ///   validation. If the socket address was spoofed, the retry token is
     ///   sent to the spoofed address, so we never hear from the attacker
     ///   again. If the address was real, the client repeats the connection
@@ -182,7 +182,7 @@ pub enum IncomingFilterOutcome {
     ///   [`Incoming::remote_addr_validated`] set to `true`. The token is
     ///   bound to the source address.
     ///
-    /// - **Relay connections** : there is no source address to validate
+    /// - **Relay connections**: there is no source address to validate
     ///   (the relay already vouches for the packet origin), so the
     ///   "validation" itself has no security meaning. However, the retry
     ///   still imposes a real cost on the client: an extra round trip
@@ -374,29 +374,35 @@ impl<P: ProtocolHandler> DynProtocolHandler for P {
 
 /// A typed map of protocol handlers, mapping them from ALPNs.
 #[derive(Debug, Default)]
-pub(crate) struct ProtocolMap(BTreeMap<Vec<u8>, Box<dyn DynProtocolHandler>>);
+pub(crate) struct ProtocolMap {
+    /// List of ALPNs in insertion order.
+    alpns: Vec<Vec<u8>>,
+    /// Map of protocol handlers by ALPN.
+    map: HashMap<Vec<u8>, Box<dyn DynProtocolHandler>>,
+}
 
 impl ProtocolMap {
     /// Returns the registered protocol handler for an ALPN as a [`Arc<dyn ProtocolHandler>`].
     pub(crate) fn get(&self, alpn: &[u8]) -> Option<&dyn DynProtocolHandler> {
-        self.0.get(alpn).map(|p| &**p)
+        self.map.get(alpn).map(|p| &**p)
     }
 
     /// Inserts a protocol handler.
     pub(crate) fn insert(&mut self, alpn: Vec<u8>, handler: Box<dyn DynProtocolHandler>) {
-        self.0.insert(alpn, handler);
+        self.alpns.push(alpn.clone());
+        self.map.insert(alpn, handler);
     }
 
     /// Returns an iterator of all registered ALPN protocol identifiers.
     pub(crate) fn alpns(&self) -> impl Iterator<Item = &Vec<u8>> {
-        self.0.keys()
+        self.alpns.iter()
     }
 
     /// Shuts down all protocol handlers.
     ///
     /// Calls and awaits [`ProtocolHandler::shutdown`] for all registered handlers concurrently.
     pub(crate) async fn shutdown(&self) {
-        let handlers = self.0.values().map(|p| p.shutdown());
+        let handlers = self.map.values().map(|p| p.shutdown());
         join_all(handlers).await;
     }
 }
@@ -480,6 +486,11 @@ impl RouterBuilder {
     /// `handler` can either be a type that implements [`ProtocolHandler`] or a
     /// [`Box<dyn DynProtocolHandler>`].
     ///
+    /// The protocols registered on the router are passed to [`Endpoint::set_alpns`] in the order
+    /// of the calls to [`Self::accept`]. Ordering matters for protocol negotiation. When an incoming
+    /// connection offers multiple ALPNs, the first matching ALPN will be chosen. This means that
+    /// your preferred protocol should be registered first on the router builder.
+    ///
     /// [`Box<dyn DynProtocolHandler>`]: DynProtocolHandler
     pub fn accept(
         mut self,
@@ -491,7 +502,7 @@ impl RouterBuilder {
         self
     }
 
-    /// Returns the [`Endpoint`] of the endpoint.
+    /// Returns the [`Endpoint`] stored in this builder.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -563,8 +574,8 @@ impl RouterBuilder {
                             match filter(&incoming) {
                                 IncomingFilterOutcome::Accept => {}
                                 IncomingFilterOutcome::Retry => {
-                                    if !incoming.remote_addr_validated() {
-                                        warn!(
+                                    if incoming.remote_addr_validated() {
+                                        debug!(
                                             "filter returned Retry for an already validated connection",
                                         );
                                     }
@@ -669,7 +680,7 @@ mod tests {
 
     use super::*;
     use crate::endpoint::{
-        ApplicationClose, BeforeConnectOutcome, ConnectError, ConnectWithOptsError,
+        ApplicationClose, BeforeConnectOutcome, ConnectError, ConnectOptions, ConnectWithOptsError,
         ConnectionError, EndpointHooks, presets,
     };
 
@@ -854,7 +865,7 @@ mod tests {
 
             let e1 = Endpoint::builder(presets::Minimal)
                 .relay_mode(relay_mode.clone())
-                .ca_roots_config(crate::tls::CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
                 .bind()
                 .await?;
             let r1 = Router::builder(e1.clone())
@@ -864,7 +875,7 @@ mod tests {
             let addr = EndpointAddr::new(e1.id()).with_relay_url(relay_url);
             let e2 = Endpoint::builder(presets::Minimal)
                 .relay_mode(relay_mode)
-                .ca_roots_config(crate::tls::CaRootsConfig::insecure_skip_verify())
+                .ca_tls_config(crate::tls::CaTlsConfig::insecure_skip_verify())
                 .bind()
                 .await?;
             Ok((r1, e2, addr, guard))
@@ -1054,6 +1065,68 @@ mod tests {
                 reason: b"shutdown".to_vec().into()
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn protocol_negotiation() -> n0_error::Result<()> {
+        // We define two ALPNs.
+        const ALPN_1: &[u8] = b"myproto/1";
+        const ALPN_2: &[u8] = b"myproto/2";
+
+        #[derive(Debug, Clone)]
+        struct Handler1;
+
+        #[derive(Debug, Clone)]
+        struct Handler2;
+
+        impl ProtocolHandler for Handler1 {
+            async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+                Ok(())
+            }
+        }
+
+        impl ProtocolHandler for Handler2 {
+            async fn accept(&self, _connection: Connection) -> Result<(), AcceptError> {
+                Ok(())
+            }
+        }
+
+        let server = Endpoint::bind(presets::N0).await?;
+        let server_addr = server.addr();
+
+        let router = Router::builder(server)
+            // Ordering is preferred-first.
+            .accept(ALPN_2, Handler2)
+            .accept(ALPN_1, Handler1)
+            .spawn();
+
+        let client = Endpoint::bind(presets::N0).await?;
+
+        // We expect ALPN_2 to be negotiated.
+        let conn = client
+            .connect_with_opts(
+                server_addr.clone(),
+                ALPN_1,
+                ConnectOptions::new().with_additional_alpns(vec![ALPN_2.to_vec()]),
+            )
+            .await?
+            .await?;
+        assert_eq!(conn.alpn(), ALPN_2);
+
+        // Ordering is server-side, so this must yield ALPN_2 as well.
+        let conn = client
+            .connect_with_opts(
+                server_addr,
+                ALPN_2,
+                ConnectOptions::new().with_additional_alpns(vec![ALPN_1.to_vec()]),
+            )
+            .await?
+            .await?;
+        assert_eq!(conn.alpn(), ALPN_2);
+
+        client.close().await;
+        router.shutdown().await.unwrap();
         Ok(())
     }
 }

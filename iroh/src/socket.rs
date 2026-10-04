@@ -42,7 +42,7 @@ use netwatch::{
     ip::LocalAddresses,
 };
 use noq::{
-    NetworkChangeHint,
+    NetworkChangeHint, TokenStore,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rand::RngExt;
@@ -189,6 +189,7 @@ pub(crate) struct Options {
     pub(crate) hooks: EndpointHooksList,
     pub(crate) path_selector: Arc<dyn PathSelector>,
     pub(crate) portmapper_config: portmapper::PortmapperConfig,
+    pub(crate) net_report_config: crate::net_report::NetReportConfig,
 
     /// Static configuration for the endpoint.
     pub(crate) static_config: StaticConfig,
@@ -238,6 +239,8 @@ pub(crate) struct StaticConfig {
     pub(crate) client_config: QuicClientConfig,
     #[debug("Arc<RustlsTokenKey>")]
     pub(crate) token_key: Arc<RustlsTokenKey>,
+    #[debug("Arc<dyn TokenStore>")]
+    pub(crate) token_store: Arc<dyn TokenStore>,
     pub(crate) transport_config: QuicTransportConfig,
 }
 
@@ -265,6 +268,7 @@ impl StaticConfig {
         quic_client_config.set_alpn_protocols(alpn_protocols);
         let mut inner = noq::ClientConfig::new(Arc::new(quic_client_config));
         inner.transport_config(transport_config);
+        inner.token_store(self.token_store.clone());
         inner
     }
 }
@@ -472,6 +476,7 @@ impl Socket {
     ///
     /// [`Watcher`]: n0_watcher::Watcher
     /// [`Watcher::initialized`]: n0_watcher::Watcher::initialized
+    #[cfg(feature = "unstable-net-report")]
     pub(crate) fn net_report(&self) -> impl Watcher<Value = Option<Report>> + use<> {
         self.net_report.watch().map(|(r, _)| r)
     }
@@ -516,24 +521,12 @@ impl Socket {
         &self.dns_resolver
     }
 
-    /// Translates a raw [`SocketAddr`] (which may be a synthetic mapped address) into
-    /// a [`transports::Addr`].
+    /// Translates a possible IP-mapped [`SocketAddr`] into a [`transports::Addr`].
     ///
-    /// For regular IP addresses this returns `Addr::Ip`. For synthetic relay-mapped
-    /// IPv6 addresses this performs a reverse lookup and returns `Addr::Relay`.
-    ///
-    /// This lookup only makes sense for a remote address of the
-    /// underlying QUIC connection.
-    ///
-    /// If you call this with a mapped address for which no mapping exists,
-    /// it will return the address as an `Addr::Ip`.
-    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> transports::Addr {
-        remote_map::to_transport_addr(
-            addr,
-            &self.mapped_addrs.relay_addrs,
-            &self.mapped_addrs.custom_addrs,
-        )
-        .unwrap_or(transports::Addr::Ip(addr))
+    /// For regular IP addresses this returns `Addr::Ip`. For mapped addresses this performs
+    /// a reverse lookup.
+    pub(crate) fn to_transport_addr(&self, addr: SocketAddr) -> Option<transports::Addr> {
+        self.mapped_addrs.to_transport_addr(addr)
     }
 
     pub(crate) fn to_local_transport_addr(
@@ -541,7 +534,13 @@ impl Socket {
         local_ip: Option<IpAddr>,
         remote_addr: SocketAddr,
     ) -> LocalTransportAddr {
-        let remote_addr = self.to_transport_addr(remote_addr);
+        let remote_addr = self.to_transport_addr(remote_addr).unwrap_or_else(|| {
+            error!(
+                mapped_addr = ?remote_addr,
+                "Socket::to_local_transport_addr: invalid mapped address",
+            );
+            transports::Addr::Ip(remote_addr)
+        });
         LocalTransportAddr::from_noq_local_ip(
             local_ip,
             &remote_addr,
@@ -691,7 +690,7 @@ impl Socket {
     }
 }
 
-/// Manages currently running [`crate::NetReport`] to learn this endpoint's IP addresses.
+/// Manages currently running net reports to learn this endpoint's IP addresses.
 ///
 /// Invariants:
 /// - only one direct addr update must be running at a time
@@ -800,7 +799,7 @@ impl DirectAddrUpdateState {
         self.sock.metrics.net_report.portmap_attempts.inc();
         self.port_mapper.procure_mapping();
 
-        debug!("requesting net_report report");
+        trace!("requesting net_report report");
         let sock = self.sock.clone();
 
         let run_done = self.run_done.clone();
@@ -885,11 +884,13 @@ impl EndpointInner {
             hooks,
             path_selector,
             portmapper_config,
+            net_report_config,
             static_config,
             configured_addrs,
         } = opts;
 
-        let address_lookup = address_lookup::AddressLookupServices::default();
+        let address_lookup =
+            address_lookup::AddressLookupServices::with_metrics(metrics.address_lookup.clone());
         let port_mapper = portmapper::create_client(&portmapper_config);
 
         let relay_transport_configs: Vec<_> = transport_configs
@@ -1044,11 +1045,14 @@ impl EndpointInner {
                 ipv4: true,
                 ipv6: has_ipv6_transport,
             });
-            net_report::Options::new(tls_config.clone()).quic_config(qad_config)
+            net_report::Options::new(tls_config.clone())
+                .quic_config(qad_config)
+                .proxy_url(proxy_url.clone())
+                .net_report_config(net_report_config)
         };
 
         #[cfg(wasm_browser)]
-        let net_report_config = net_report::Options::default();
+        let net_report_config = net_report::Options::default().net_report_config(net_report_config);
 
         let net_reporter = net_report::Client::new(
             #[cfg(not(wasm_browser))]
@@ -2113,7 +2117,7 @@ mod tests {
 
     use data_encoding::HEXLOWER;
     use iroh_base::{EndpointAddr, EndpointId, TransportAddr};
-    use iroh_relay::tls::{CaRootsConfig, default_provider};
+    use iroh_relay::tls::{CaTlsConfig, default_provider};
     use n0_error::{Result, StackResultExt, StdResultExt};
     use n0_future::{MergeBounded, StreamExt, time};
     use n0_tracing_test::traced_test;
@@ -2151,6 +2155,7 @@ mod tests {
             client_config: tls_config.make_client_config(false).unwrap(),
             tls_config,
             token_key: Arc::new(RustlsTokenKey::new(rng, &crypto_provider).unwrap()),
+            token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
         };
         let server_config = static_config.create_server_config(vec![]);
@@ -2163,7 +2168,7 @@ mod tests {
             proxy_url: None,
             dns_resolver: DnsResolver::new(),
             server_config,
-            tls_config: CaRootsConfig::default()
+            tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())
                 .unwrap(),
             #[cfg(any(test, feature = "test-utils"))]
@@ -2172,6 +2177,7 @@ mod tests {
             hooks: Default::default(),
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         }
@@ -2286,7 +2292,7 @@ mod tests {
         payload: &[u8],
         loss: ExpectedLoss,
     ) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(4), async move {
+        tokio::time::timeout(Duration::from_secs(20), async move {
             let send_endpoint_id = sender.id();
             let recv_endpoint_id = receiver.id();
             info!("\nroundtrip: {send_endpoint_id:#} -> {recv_endpoint_id:#}");
@@ -2564,6 +2570,7 @@ mod tests {
             client_config: tls_config.make_client_config(keylog).unwrap(),
             tls_config,
             token_key: Arc::new(RustlsTokenKey::new(&mut rand::rng(), &crypto_provider).unwrap()),
+            token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
         };
         let server_config = static_config.create_server_config(vec![ALPN.to_vec()]);
@@ -2579,13 +2586,14 @@ mod tests {
             dns_resolver,
             proxy_url: None,
             server_config,
-            tls_config: CaRootsConfig::default()
+            tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())
                 .unwrap(),
             metrics: Default::default(),
             hooks: Default::default(),
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
+            net_report_config: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         };

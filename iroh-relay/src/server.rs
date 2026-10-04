@@ -58,6 +58,7 @@ use crate::{
     defaults::DEFAULT_KEY_CACHE_CAPACITY,
     http::{AUTH_TOKEN_URL_QUERY_PARAM, ProtocolVersion, RELAY_PROBE_PATH},
     quic::server::{QuicServer, QuicSpawnError, ServerHandle as QuicServerHandle},
+    tls::CaTlsConfig,
 };
 
 pub mod client;
@@ -465,7 +466,7 @@ pub struct TlsConfig {
     /// the main relay server this has to be on a different port.  When TLS is not enabled
     /// this is served on the [`RelayConfig::http_bind_addr`] socket address.
     ///
-    /// Normally you'd choose port `80`.
+    /// Normally you'd choose port `443`.
     pub https_bind_addr: SocketAddr,
     /// Mode for getting a cert.
     pub cert: CertConfig,
@@ -486,16 +487,20 @@ impl TlsConfig {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct Limits {
-    /// Rate limit for accepting new connection. Unlimited if not set.
-    pub accept_conn_limit: Option<f64>,
-    /// Burst limit for accepting new connection. Unlimited if not set.
-    pub accept_conn_burst: Option<usize>,
     /// Rate limits for incoming traffic from a client connection.
     pub client_rx: Option<ClientRateLimit>,
+    /// Rate limit for accepting new connections. Unlimited if not set.
+    ///
+    /// Not currently implemented, setting this has no effect.
+    pub accept_conn_limit: Option<f64>,
+    /// Burst limit for accepting new connections. Unlimited if not set.
+    ///
+    /// Not currently implemented, setting this has no effect.
+    pub accept_conn_burst: Option<usize>,
 }
 
 /// Per-client rate limit configuration.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClientRateLimit {
     /// Max number of bytes per second to read from the client connection.
@@ -545,6 +550,7 @@ pub struct AcmeConfig {
     pub(crate) domains: Vec<String>,
     pub(crate) contact: Vec<String>,
     pub(crate) cache_path: Option<PathBuf>,
+    pub(crate) tls_config: CaTlsConfig,
 }
 
 impl AcmeConfig {
@@ -555,6 +561,7 @@ impl AcmeConfig {
             domains: Vec::new(),
             contact: Vec::new(),
             cache_path: None,
+            tls_config: CaTlsConfig::default(),
         }
     }
 
@@ -587,6 +594,16 @@ impl AcmeConfig {
     /// If not called certificates will not be cached.
     pub fn cache_path(mut self, path: PathBuf) -> Self {
         self.cache_path = Some(path);
+        self
+    }
+
+    /// Sets the [`CaTlsConfig`] used to verify the ACME server's TLS certificate.
+    ///
+    /// Defaults to [`CaTlsConfig::embedded`]. Set a config with extra roots when targeting
+    /// an ACME server whose certificate is not signed by a publicly trusted CA, such as a
+    /// local test server.
+    pub fn tls_config(mut self, tls_config: CaTlsConfig) -> Self {
+        self.tls_config = tls_config;
         self
     }
 }
@@ -632,6 +649,11 @@ pub enum SpawnError {
     TlsHeaderParse { source: InvalidHeaderValue },
     #[error("Failed to bind TcpListener")]
     BindTlsListener { source: std::io::Error },
+    #[error("Failed to build ACME client TLS config")]
+    AcmeClientTlsConfig {
+        #[error(std_err)]
+        source: std::io::Error,
+    },
     #[error("No local address")]
     NoLocalAddr { source: std::io::Error },
     #[error("Failed to bind server socket to {addr}")]
@@ -727,11 +749,20 @@ impl Server {
                                 server_config_builder,
                             } => {
                                 let cache = acme_config.cache_path.map(DirCache::new);
+                                let crypto_provider =
+                                    server_config_builder.crypto_provider().clone();
+                                let client_tls_config = acme_config
+                                    .tls_config
+                                    .client_config(crypto_provider)
+                                    .map_err(|err| e!(SpawnError::AcmeClientTlsConfig, err))?;
                                 let config =
-                                    tokio_rustls_acme::AcmeConfig::new(acme_config.domains)
-                                        .contact(acme_config.contact)
-                                        .directory(acme_config.directory_url)
-                                        .cache_option(cache);
+                                    tokio_rustls_acme::AcmeConfig::new_with_client_tls_config(
+                                        acme_config.domains,
+                                        Arc::new(client_tls_config),
+                                    )
+                                    .contact(acme_config.contact)
+                                    .directory(acme_config.directory_url)
+                                    .cache_option(cache);
                                 let mut state = config.state();
                                 let resolver = state.resolver().clone();
                                 let server_config =
@@ -1067,7 +1098,7 @@ fn healthz_handler(
     let health = Health {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
-        git_hash: option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        git_hash: "unknown",
     };
     let body = serde_json::to_string(&health).unwrap_or_else(|_| r#"{"status":"error"}"#.into());
     let body: BytesBody = Box::new(Full::from(body));
@@ -1161,11 +1192,12 @@ mod tests {
     use http::StatusCode;
     use iroh_base::{EndpointId, RelayUrl, SecretKey};
     use iroh_dns::dns::DnsResolver;
-    use n0_error::Result;
+    use n0_error::{Result, StackResultExt, StdResultExt};
     use n0_future::{SinkExt, StreamExt};
     use n0_tracing_test::traced_test;
     use rand::{RngExt, SeedableRng};
     use tracing::{info, instrument};
+    use url::Url;
 
     use super::{
         Access, AccessControl, ClientRequest, NO_CONTENT_CHALLENGE_HEADER,
@@ -1177,7 +1209,8 @@ mod tests {
             handshake,
             relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
         },
-        tls::{CaRootsConfig, default_provider},
+        test_utils::static_resolver,
+        tls::{self, CaTlsConfig, default_provider},
     };
 
     /// An [`AccessControl`] backed by a closure, for tests.
@@ -1314,7 +1347,7 @@ mod tests {
         let relay_url = format!("http://{}", server.http_addr().unwrap());
         let relay_url: RelayUrl = relay_url.parse()?;
 
-        let client_config = CaRootsConfig::default()
+        let client_config = CaTlsConfig::default()
             .client_config(default_provider())
             .unwrap();
 
@@ -1379,7 +1412,7 @@ mod tests {
         let current_span = tracing::info_span!("this is a test");
         let _guard = current_span.enter();
 
-        let client_config = CaRootsConfig::default()
+        let client_config = CaTlsConfig::default()
             .client_config(default_provider())
             .unwrap();
 
@@ -1468,7 +1501,7 @@ mod tests {
         const TOKEN: &str = "secret-token";
 
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
-        let client_config = CaRootsConfig::default()
+        let client_config = CaTlsConfig::default()
             .client_config(default_provider())
             .unwrap();
 
@@ -1535,7 +1568,7 @@ mod tests {
         let relay_url = format!("http://{}", server.http_addr().unwrap());
         let relay_url: RelayUrl = relay_url.parse().unwrap();
 
-        let client_config = CaRootsConfig::default()
+        let client_config = CaTlsConfig::default()
             .client_config(default_provider())
             .unwrap();
 
@@ -1567,6 +1600,42 @@ mod tests {
                 })
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Regression test: A relay client that prefers IPv6 falls back to IPv4
+    /// when the advertised IPv6 address is unreachable.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_relay_client_falls_back_to_ipv4() -> Result {
+        // A relay reachable only over IPv4.
+        let config = ServerConfig {
+            relay: Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0))),
+            ..Default::default()
+        };
+        let server = Server::spawn(config).await?;
+        let addr = server.http_addr().expect("http relay address");
+
+        // Resolves to both the real IPv4 address and an unreachable IPv6 address.
+        let resolver = static_resolver(
+            vec![Ipv4Addr::LOCALHOST],
+            vec!["2001:db8::dead".parse().expect("valid IPv6")],
+        );
+        let url: Url = format!("http://relay.test:{}", addr.port())
+            .parse()
+            .expect("valid relay url");
+
+        let client = ClientBuilder::new(url, SecretKey::generate(), resolver)
+            .tls_client_config(tls::make_dangerous_client_config())
+            // Force IPv6 preference
+            .address_family_selector(|| true);
+
+        tokio::time::timeout(Duration::from_secs(10), client.connect())
+            .await
+            .with_std_context(|_| "relay connect timed out")?
+            .context("relay connect")?;
+
+        server.shutdown().await.context("relay server shutdown")?;
         Ok(())
     }
 }
